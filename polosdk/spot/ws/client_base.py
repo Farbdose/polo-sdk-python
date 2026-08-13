@@ -106,9 +106,25 @@ class ClientBase:
                     while self._keep_alive:
                         try:
                             msg = await socket.recv()
+                        except Exception:
+                            # The socket itself is dead: retrying recv() on it
+                            # forever (the previous behavior here) either spams
+                            # identical errors if recv() still yields, or -- on
+                            # some closed-connection paths -- never yields at
+                            # all, which starves the whole asyncio event loop
+                            # indefinitely. Re-raise instead, so it reaches the
+                            # outer handler below: that one already closes this
+                            # socket (via `finally`) and opens a genuinely new
+                            # connection after a backoff delay, exactly once.
+                            raise
+                        try:
                             msg = json.loads(msg)
                             self._on_message(msg)
                         except Exception as err:
+                            # A malformed message or a bug in the caller's own
+                            # on_message handler is not a connection failure --
+                            # the socket is still fine, so just report it and
+                            # keep receiving.
                             if self._on_error is not None:
                                 self._on_error(err)
             except Exception as err:
