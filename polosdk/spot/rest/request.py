@@ -1,4 +1,5 @@
 import json
+import threading
 import urllib
 
 import requests
@@ -10,6 +11,39 @@ from urllib.parse import urljoin
 
 
 _default_url = 'https://api.poloniex.com'
+
+# Connections are reused across calls. `requests.request()` builds a throwaway
+# Session per call, so every REST call paid a fresh TCP plus TLS handshake --
+# measured from a Tokyo host against api.poloniex.com, that is ~6 ms of TCP and
+# ~12 ms of TLS on top of a ~47 ms total, i.e. the handshakes were roughly 40 %
+# of every order round trip and were being paid again on the next order.
+#
+# One Session per thread rather than one global: requests Sessions are not
+# documented as thread-safe, and callers commonly drive this SDK from a thread
+# pool (blocking REST wrapped in run_in_executor). A bounded pool means a
+# handful of long-lived connections, which is exactly what keep-alive wants.
+#
+# max_retries stays 0 -- the urllib3 default of retrying idempotent-looking
+# requests must not be turned on here. A retried POST /orders is a duplicate
+# order, not a recovered one.
+_thread_local = threading.local()
+
+_POOL_SIZE = 16
+
+
+def _session():
+    session = getattr(_thread_local, 'session', None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=_POOL_SIZE,
+            pool_maxsize=_POOL_SIZE,
+            max_retries=0,
+        )
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        _thread_local.session = session
+    return session
 
 
 class RequestError(Exception):
@@ -88,12 +122,12 @@ class Request:
                 raise RequestError(-1, "Authenticated endpoints required api_secret and api_key to be set.")
 
         url = urljoin(self._url, path)
-        response = requests.request(method,
-                                    url,
-                                    headers=headers,
-                                    timeout=self._timeout_sec,
-                                    params=params,
-                                    data=body)
+        response = _session().request(method,
+                                      url,
+                                      headers=headers,
+                                      timeout=self._timeout_sec,
+                                      params=params,
+                                      data=body)
         try:
             response_json = response.json()
         except Exception:
